@@ -40,7 +40,7 @@ def read_root():
 
 @app.post("/items")
 def create_item(item: ItemCreate, db: Session = Depends(get_db)):
-    db_item = models.Item(title=item.title, type=item.type)
+    db_item = models.Item(title=item.title, type=item.type.lower)
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
@@ -48,8 +48,17 @@ def create_item(item: ItemCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/items")
-def list_items(db: Session = Depends(get_db)):
-    return db.query(models.Item).all()
+def list_items(
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(models.Item)
+    if status:
+        query = query.filter(models.Item.status.ilike(status))
+    if type:
+        query = query.filter(models.Item.type.ilike(type))
+    return query.all()
 
 
 @app.get("/items/{item_id}")
