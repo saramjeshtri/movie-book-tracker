@@ -1,134 +1,127 @@
 """Tests for the external API integration layer.
 
 All HTTP traffic is intercepted via ``respx`` so the tests don't depend on
-Wikipedia or Open Library being reachable. Both providers are keyless, so
-no env-var setup is needed.
+OMDb or Google Books being reachable. The OMDb API key is set via env var
+to satisfy :func:`services.external_api._get_omdb_key`.
 """
 
 from __future__ import annotations
 
-import re
+import os
 
 import httpx
 import pytest
 import respx
 
-from services.external_api import (
-    OPEN_LIBRARY_BASE_URL,
-    WIKIPEDIA_BASE_URL,
+# Provide a fake key before importing the module under test so the env
+# lookup at call-time sees it.
+os.environ.setdefault("OMDB_API_KEY", "test-omdb-key")
+os.environ.setdefault("GOOGLE_BOOKS_API_KEY", "test-gbooks-key")
+
+from services.external_api import (  # noqa: E402  (import after env setup)
+    GOOGLE_BOOKS_BASE_URL,
+    OMDB_BASE_URL,
     FetchError,
     fetch_info,
 )
 
-# respx's default URL matcher is strict about percent-encoding — the real
-# outgoing URL contains %20 for spaces. Using a regex lets every
-# Wikipedia call get matched regardless of title.
-WIKI_URL_PATTERN = re.compile(rf"^{re.escape(WIKIPEDIA_BASE_URL)}/.*$")
-
-WIKI_OK = {
-    "type": "standard",
-    "title": "Inception",
-    "extract": "Inception is a 2010 science-fiction action film...",
-    "description": "2010 film by Christopher Nolan",
-    "thumbnail": {
-        "source": "https://upload.wikimedia.org/.../Inception.jpg",
-        "width": 220,
-        "height": 326,
-    },
+OMDB_OK = {
+    "Title": "Inception",
+    "Year": "2010",
+    "Genre": "Action, Adventure, Sci-Fi",
+    "Plot": "A thief who steals corporate secrets...",
+    "Poster": "https://m.media-amazon.com/images/inception.jpg",
+    "Response": "True",
 }
 
-WIKI_NO_THUMB = {
-    "type": "standard",
-    "title": "Some Obscure Film",
-    "extract": "...",
-    "description": "1999 short film",
+OMDB_NOT_FOUND = {
+    "Response": "False",
+    "Error": "Movie not found!",
 }
 
-WIKI_DISAMBIG = {
-    "type": "disambiguation",
-    "title": "Mercury",
-    "extract": "Mercury may refer to: ...",
+OMDB_NO_POSTER = {
+    "Title": "Some Obscure Film",
+    "Year": "1999",
+    "Genre": "Drama",
+    "Plot": "...",
+    "Poster": "N/A",
+    "Response": "True",
 }
 
-OPENLIB_OK = {
-    "numFound": 1,
-    "docs": [
+GBOOKS_OK = {
+    "totalItems": 1,
+    "items": [
         {
-            "title": "The Hobbit",
-            "first_publish_year": 1937,
-            "cover_i": 10520091,
-            "subject": ["Fantasy fiction", "Adventure", "Middle Earth"],
-            "first_sentence": "In a hole in the ground there lived a hobbit.",
+            "volumeInfo": {
+                "title": "The Hobbit",
+                "publishedDate": "1937-09-21",
+                "description": "Bilbo Baggins is a hobbit...",
+                "categories": ["Fantasy fiction", "Adventure"],
+                "imageLinks": {
+                    "thumbnail": "http://books.google.com/hobbit.jpg",
+                },
+            }
         }
     ],
 }
 
-OPENLIB_NO_RESULTS = {"numFound": 0, "docs": []}
+GBOOKS_NOT_FOUND = {"totalItems": 0, "items": []}
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_successful_movie_fetch():
-    """Wikipedia summary → normalized movie record."""
-    respx.get(WIKI_URL_PATTERN).mock(
-        return_value=httpx.Response(200, json=WIKI_OK)
+    """Happy path: OMDb returns a real movie — fields are normalized."""
+    respx.get(OMDB_BASE_URL).mock(
+        return_value=httpx.Response(200, json=OMDB_OK)
     )
 
     record = await fetch_info("Inception", "movie")
 
     assert record == {
         "title": "Inception",
-        "poster_url": "https://upload.wikimedia.org/.../Inception.jpg",
-        "description": "Inception is a 2010 science-fiction action film...",
+        "poster_url": "https://m.media-amazon.com/images/inception.jpg",
+        "description": "A thief who steals corporate secrets...",
         "year": 2010,
-        "genre": None,
+        "genre": "Action, Adventure, Sci-Fi",
     }
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_successful_book_fetch():
-    """Open Library search → cover URL built from cover_i, subjects joined."""
-    respx.get(OPEN_LIBRARY_BASE_URL).mock(
-        return_value=httpx.Response(200, json=OPENLIB_OK)
+    """Happy path: Google Books returns a real book — categories join into genre."""
+    respx.get(GOOGLE_BOOKS_BASE_URL).mock(
+        return_value=httpx.Response(200, json=GBOOKS_OK)
     )
 
     record = await fetch_info("The Hobbit", "book")
 
     assert record == {
         "title": "The Hobbit",
-        "poster_url": "https://covers.openlibrary.org/b/id/10520091-M.jpg",
-        "description": "In a hole in the ground there lived a hobbit.",
+        "poster_url": "http://books.google.com/hobbit.jpg",
+        "description": "Bilbo Baggins is a hobbit...",
         "year": 1937,
-        "genre": "Fantasy fiction, Adventure, Middle Earth",
+        "genre": "Fantasy fiction, Adventure",
     }
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_title_not_found():
-    """Both providers signal 'not found' differently — both yield 404."""
-
-    # Wikipedia: 404 HTTP status for missing articles.
-    respx.get(WIKI_URL_PATTERN).mock(
-        return_value=httpx.Response(404, json={"detail": "Not found."})
+    """Both providers signal 'not found' differently — both must yield 404."""
+    # OMDb uses Response="False"
+    respx.get(OMDB_BASE_URL).mock(
+        return_value=httpx.Response(200, json=OMDB_NOT_FOUND)
     )
     with pytest.raises(FetchError) as exc_info:
         await fetch_info("zzzznonexistent", "movie")
     assert exc_info.value.status_code == 404
     assert "No results found" in exc_info.value.message
 
-    # Wikipedia: also a 200 response with type=="disambiguation".
-    respx.get(WIKI_URL_PATTERN).mock(
-        return_value=httpx.Response(200, json=WIKI_DISAMBIG)
-    )
-    with pytest.raises(FetchError) as exc_info:
-        await fetch_info("Mercury", "movie")
-    assert exc_info.value.status_code == 404
-
-    # Open Library: numFound=0 in a 200 response.
-    respx.get(OPEN_LIBRARY_BASE_URL).mock(
-        return_value=httpx.Response(200, json=OPENLIB_NO_RESULTS)
+    # Google Books uses totalItems=0
+    respx.get(GOOGLE_BOOKS_BASE_URL).mock(
+        return_value=httpx.Response(200, json=GBOOKS_NOT_FOUND)
     )
     with pytest.raises(FetchError) as exc_info:
         await fetch_info("zzzznonexistent", "book")
@@ -139,23 +132,23 @@ async def test_title_not_found():
 @pytest.mark.asyncio
 @respx.mock
 async def test_api_timeout_raises_502():
-    """If Wikipedia hangs past the timeout, surface a 502 — don't crash."""
-    respx.get(WIKI_URL_PATTERN).mock(
+    """If OMDb hangs past the timeout, surface a 502 — don't crash."""
+    respx.get(OMDB_BASE_URL).mock(
         side_effect=httpx.TimeoutException("boom")
     )
 
     with pytest.raises(FetchError) as exc_info:
         await fetch_info("Inception", "movie")
     assert exc_info.value.status_code == 502
-    assert "unreachable" in exc_info.value.message.lower()
+    assert "External API" in exc_info.value.message or "unreachable" in exc_info.value.message
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_partial_data_no_thumbnail():
-    """Wikipedia page with no thumbnail → poster_url is None, no crash."""
-    respx.get(WIKI_URL_PATTERN).mock(
-        return_value=httpx.Response(200, json=WIKI_NO_THUMB)
+async def test_partial_data_no_poster():
+    """Missing poster (OMDb 'N/A') should be None, not crash."""
+    respx.get(OMDB_BASE_URL).mock(
+        return_value=httpx.Response(200, json=OMDB_NO_POSTER)
     )
 
     record = await fetch_info("Some Obscure Film", "movie")
@@ -163,7 +156,20 @@ async def test_partial_data_no_thumbnail():
     assert record["title"] == "Some Obscure Film"
     assert record["poster_url"] is None
     assert record["year"] == 1999
-    assert record["genre"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_omdb_key():
+    """No OMDB_API_KEY in env → clear error before any HTTP call."""
+    saved = os.environ.pop("OMDB_API_KEY", None)
+    try:
+        with pytest.raises(FetchError) as exc_info:
+            await fetch_info("Inception", "movie")
+        assert exc_info.value.status_code == 500
+        assert "OMDB_API_KEY" in exc_info.value.message
+    finally:
+        if saved is not None:
+            os.environ["OMDB_API_KEY"] = saved
 
 
 @pytest.mark.asyncio
@@ -176,26 +182,28 @@ async def test_unsupported_type():
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_openlibrary_subject_list_capped():
-    """Subject list is capped (5) to keep genre field readable."""
-    many_subjects = [f"Subject {i}" for i in range(20)]
-    respx.get(OPEN_LIBRARY_BASE_URL).mock(
+async def test_year_extracted_from_various_date_formats():
+    """Google Books sometimes returns '2010-08', OMDb '2010-2014' — first 4 digits wins."""
+    respx.get(GOOGLE_BOOKS_BASE_URL).mock(
         return_value=httpx.Response(
             200,
             json={
-                "numFound": 1,
-                "docs": [
+                "totalItems": 1,
+                "items": [
                     {
-                        "title": "Many Subjects Book",
-                        "first_publish_year": 2020,
-                        "subject": many_subjects,
+                        "volumeInfo": {
+                            "title": "Partial Date Book",
+                            "publishedDate": "2010-08",
+                            "imageLinks": {},
+                            "categories": [],
+                        }
                     }
                 ],
             },
         )
     )
 
-    record = await fetch_info("Many Subjects Book", "book")
-    assert record["genre"] is not None
-    assert record["genre"].count(",") == 4  # 5 items → 4 commas
-    assert record["genre"].startswith("Subject 0,")
+    record = await fetch_info("Partial Date Book", "book")
+    assert record["year"] == 2010
+    assert record["genre"] is None  # empty list joined to nothing
+    assert record["poster_url"] is None
