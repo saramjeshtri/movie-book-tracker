@@ -1,10 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
 
 from database import engine, Base, SessionLocal
 import models
+from services.external_api import fetch_info, FetchError
 
 # Create all tables on startup
 Base.metadata.create_all(bind=engine)
@@ -40,7 +41,7 @@ def read_root():
 
 @app.post("/items")
 def create_item(item: ItemCreate, db: Session = Depends(get_db)):
-    db_item = models.Item(title=item.title, type=item.type.lower)
+    db_item = models.Item(title=item.title, type=item.type.lower())
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
@@ -91,3 +92,21 @@ def delete_item(item_id: int, db: Session = Depends(get_db)):
     db.delete(item)
     db.commit()
     return {"message": "Item deleted"}
+
+
+@app.get("/fetch-info")
+async def fetch_info_endpoint(
+    title: str = Query(..., min_length=1, description="Title to look up"),
+    type: str = Query(
+        ..., pattern="^(?i)(movie|book)$", description="Either 'movie' or 'book'"
+    ),
+):
+    """Look up a movie/book by title via OMDb / Google Books.
+
+    Returns the normalized record so the frontend can prefill the create
+    form. Errors are translated into HTTP responses the frontend can show.
+    """
+    try:
+        return await fetch_info(title=title, type_=type)
+    except FetchError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
