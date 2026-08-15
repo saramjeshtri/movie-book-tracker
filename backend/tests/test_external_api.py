@@ -99,7 +99,7 @@ async def test_successful_book_fetch():
 
     assert record == {
         "title": "The Hobbit",
-        "poster_url": "http://books.google.com/hobbit.jpg",
+        "poster_url": "https://books.google.com/hobbit.jpg",
         "description": "Bilbo Baggins is a hobbit...",
         "year": 1937,
         "genre": "Fantasy fiction, Adventure",

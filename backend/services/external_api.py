@@ -147,11 +147,15 @@ async def _fetch_movie(title: str) -> NormalizedRecord:
 
 
 def _normalize_poster(value: Any) -> Optional[str]:
-    """OMDb returns 'N/A' for missing posters — treat that as None."""
+    """OMDb returns 'N/A' for missing posters — treat that as None.
+
+    Google Books thumbnails come back as ``http://`` URLs; bump to
+    ``https://`` so the browser doesn't warn about mixed content.
+    """
     s = _safe_str(value)
     if not s or s.upper() == "N/A":
         return None
-    return s
+    return s.replace("http://", "https://", 1) if s.startswith("http://") else s
 
 
 # --- Google Books -----------------------------------------------------------
