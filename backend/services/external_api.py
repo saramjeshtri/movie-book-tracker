@@ -1,26 +1,25 @@
 """External API integration for Movie & Book Tracker.
 
-Two free sources:
-- OMDb (http://www.omdbapi.com/) for movies — requires OMDB_API_KEY.
-- Google Books (https://www.googleapis.com/books/v1/volumes) for books — no
-  key required, but an optional GOOGLE_BOOKS_API_KEY raises the rate limit.
+Two keyless sources:
+- Wikipedia REST API (https://en.wikipedia.org/api/rest_v1/) for movies.
+- Open Library (https://openlibrary.org/search.json) for books.
 
-Public entry point: :func:`fetch_info`. It routes by ``type``, calls the
-appropriate provider, and normalizes the result into the shared schema::
+Both are free and require no API key. Public entry point:
+:func:`fetch_info`. It routes by ``type``, calls the appropriate provider,
+and normalizes the result into the shared schema::
 
     { "title": str, "poster_url": str | None, "description": str | None,
       "year": int | None, "genre": str | None }
 
-Every upstream failure mode (not found, timeout, 5xx, rate limit, bad key)
-raises a :class:`FetchError` with an HTTP-style status code so the FastAPI
-route can translate it into the right response.
+Every upstream failure mode (not found, timeout, 5xx, rate limit) raises
+:class:`FetchError` with an HTTP-style status code so the FastAPI route
+can translate it into the right response.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -31,8 +30,12 @@ logger = logging.getLogger(__name__)
 
 # --- Config -----------------------------------------------------------------
 
-OMDB_BASE_URL = "http://www.omdbapi.com/"
-GOOGLE_BOOKS_BASE_URL = "https://www.googleapis.com/books/v1/volumes"
+# Wikipedia REST: trailing path is the (URL-encoded) article title.
+# We use the "summary" endpoint which returns a normalized record per page.
+WIKIPEDIA_BASE_URL = "https://en.wikipedia.org/api/rest_v1/page/summary"
+
+# Open Library search: q=...&limit=1 returns the single best match.
+OPEN_LIBRARY_BASE_URL = "https://openlibrary.org/search.json"
 
 # Per-request timeout. Short enough that a hung upstream doesn't pin the
 # FastAPI worker, long enough for a slow but healthy response.
@@ -103,99 +106,104 @@ async def fetch_info(title: str, type_: str) -> dict[str, Any]:
     return record.to_dict()
 
 
-# --- OMDb (movies) ----------------------------------------------------------
-
-def _get_omdb_key() -> str:
-    key = os.environ.get("OMDB_API_KEY", "").strip()
-    if not key:
-        raise FetchError(
-            "OMDB_API_KEY environment variable is not set — get a free key "
-            "from http://www.omdbapi.com/apikey.aspx and export it",
-            500,
-        )
-    return key
-
+# --- Wikipedia (movies) -----------------------------------------------------
 
 async def _fetch_movie(title: str) -> NormalizedRecord:
-    api_key = _get_omdb_key()
-    params = {"t": title, "apikey": api_key, "plot": "short"}
+    # Wikipedia titles are URL path segments — let httpx percent-encode.
+    url = f"{WIKIPEDIA_BASE_URL}/{title}"
 
     payload = await _get_json_with_retries(
-        url=OMDB_BASE_URL,
-        params=params,
-        # OMDb signals "not found" via Response="False" + Error="Movie not
-        # found!" in a 200 response. We map that to a 404 ourselves.
-        is_not_found=lambda body: (
-            isinstance(body, dict)
-            and str(body.get("Response", "")).lower() == "false"
-        ),
+        url=url,
+        params=None,
+        is_not_found=lambda body: False,  # 404 HTTP status handles not-found
+        not_found_status_codes=(404,),
     )
 
-    # If retries didn't surface it earlier, double-check the flag here too
-    # (defense-in-depth in case the heuristic ever drifts).
-    if str(payload.get("Response", "True")).lower() == "false":
-        err = payload.get("Error", "Movie not found")
+    # Wikipedia summary responses look like:
+    #   { "type": "standard", "title": "Inception",
+    #     "extract": "Inception is a 2010 science-fiction action film ...",
+    #     "thumbnail": {"source": "https://.../Inception.jpg", ...},
+    #     "description": "2010 film by Christopher Nolan",
+    #     "originalimage": {...} }
+    #
+    # Disambiguation pages come back as type=="disambiguation" with no
+    # useful extract — treat as not-found.
+
+    page_type = payload.get("type")
+    if page_type == "disambiguation":
         raise FetchError(f"No results found for '{title}'", 404)
 
+    # Wikipedia's "description" string often carries the year, e.g.
+    # "2010 film by Christopher Nolan". Use it as a year source but only
+    # if the explicit year field is missing.
+    year = _parse_year(payload.get("description"))
+    # Some pages also expose a "film_release_year" via coordinates? No —
+    # safer to fall back to the first 4-digit year in the description.
+
     return NormalizedRecord(
-        title=_safe_str(payload.get("Title")) or title,
-        poster_url=_normalize_poster(payload.get("Poster")),
-        description=_safe_str(payload.get("Plot")),
-        year=_parse_year(payload.get("Year")),
-        genre=_safe_str(payload.get("Genre")),
+        title=_safe_str(payload.get("title")) or title,
+        poster_url=_extract_thumbnail(payload.get("thumbnail"))
+            or _extract_thumbnail(payload.get("originalimage")),
+        description=_safe_str(payload.get("extract")),
+        year=year,
+        genre=None,  # Wikipedia summary doesn't expose genres
     )
 
 
-def _normalize_poster(value: Any) -> Optional[str]:
-    """OMDb returns 'N/A' for missing posters — treat that as None."""
-    s = _safe_str(value)
-    if not s or s.upper() == "N/A":
+def _extract_thumbnail(image_obj: Any) -> Optional[str]:
+    if not isinstance(image_obj, dict):
         return None
-    return s
+    src = image_obj.get("source")
+    if not src:
+        return None
+    # Wikipedia returns http:// thumbnails; bump to https:// so the browser
+    # doesn't warn about mixed content.
+    return src.replace("http://", "https://", 1) if src.startswith("http://") else src
 
 
-# --- Google Books -----------------------------------------------------------
-
-def _get_google_books_key() -> Optional[str]:
-    return os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip() or None
-
+# --- Open Library (books) ---------------------------------------------------
 
 async def _fetch_book(title: str) -> NormalizedRecord:
-    params: dict[str, str] = {"q": title, "maxResults": "1"}
-    api_key = _get_google_books_key()
-    if api_key:
-        params["key"] = api_key
+    params = {"q": title, "limit": "1"}
 
     payload = await _get_json_with_retries(
-        url=GOOGLE_BOOKS_BASE_URL,
+        url=OPEN_LIBRARY_BASE_URL,
         params=params,
         is_not_found=lambda body: (
-            isinstance(body, dict) and body.get("totalItems", 0) == 0
+            isinstance(body, dict) and int(body.get("numFound", 0)) == 0
         ),
     )
 
-    items = payload.get("items") or []
-    if not items:
+    docs = payload.get("docs") or []
+    if not docs:
         raise FetchError(f"No results found for '{title}'", 404)
 
-    info = items[0].get("volumeInfo", {}) or {}
-    image_links = info.get("imageLinks") or {}
+    doc = docs[0]
+    cover_id = doc.get("cover_i")
+    poster_url = (
+        f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
+        if cover_id is not None
+        else None
+    )
 
     return NormalizedRecord(
-        title=_safe_str(info.get("title")) or title,
-        poster_url=_normalize_poster(image_links.get("thumbnail")),
-        description=_safe_str(info.get("description")),
-        year=_parse_year(info.get("publishedDate")),
-        genre=_join_categories(info.get("categories")),
+        title=_safe_str(doc.get("title")) or title,
+        poster_url=poster_url,
+        description=_safe_str(doc.get("first_sentence"))
+            or _join_subjects(doc.get("subject")),  # fall back to subjects as blurb
+        year=_parse_year(doc.get("first_publish_year")),
+        genre=_join_subjects(doc.get("subject")),
     )
 
 
-def _join_categories(value: Any) -> Optional[str]:
-    """Google Books returns ``categories`` as a list of strings."""
+def _join_subjects(value: Any, max_items: int = 5) -> Optional[str]:
+    """Open Library returns ``subject`` as a list of strings — cap and join."""
     if isinstance(value, list):
         parts = [str(v).strip() for v in value if v]
         parts = [p for p in parts if p]
-        return ", ".join(parts) if parts else None
+        if not parts:
+            return None
+        return ", ".join(parts[:max_items])
     return _safe_str(value)
 
 
@@ -204,10 +212,11 @@ def _join_categories(value: Any) -> Optional[str]:
 async def _get_json_with_retries(
     *,
     url: str,
-    params: dict[str, str],
+    params: Optional[dict[str, str]],
     is_not_found: Any,
+    not_found_status_codes: tuple[int, ...] = (),
 ) -> dict[str, Any]:
-    """GET ``url?params`` as JSON, retrying transient network errors.
+    """GET ``url[?params]`` as JSON, retrying transient network errors.
 
     Non-transient failures (404, 401/403, 429) raise :class:`FetchError`
     immediately — the caller wants those surfaced, not retried.
@@ -227,11 +236,11 @@ async def _get_json_with_retries(
                     429,
                 )
 
-            # 401 / 403 — bad key. Surface immediately.
+            # 401 / 403 — bad auth (not relevant for our keyless APIs, but
+            # defensive in case Wikipedia ever requires one).
             if response.status_code in (401, 403):
                 raise FetchError(
-                    "External API rejected the request — check your "
-                    "OMDB_API_KEY / GOOGLE_BOOKS_API_KEY",
+                    "External API rejected the request",
                     500,
                 )
 
@@ -245,6 +254,17 @@ async def _get_json_with_retries(
                 attempt += 1
                 continue
 
+            # Explicit "not found" codes (e.g. Wikipedia 404 for missing
+            # articles) — surface immediately, no retry.
+            if response.status_code in not_found_status_codes:
+                title_hint = (
+                    (params or {}).get("q")
+                    or url.rsplit("/", 1)[-1]
+                )
+                raise FetchError(
+                    f"No results found for '{title_hint}'", 404
+                )
+
             # 4xx (other) — bad request shape, don't retry.
             if response.status_code >= 400:
                 raise FetchError(
@@ -255,7 +275,6 @@ async def _get_json_with_retries(
             body = response.json()
 
         except FetchError:
-            # Already classified — re-raise.
             raise
         except httpx.TimeoutException as exc:
             last_exc = exc
@@ -264,7 +283,6 @@ async def _get_json_with_retries(
             attempt += 1
             continue
         except httpx.HTTPError as exc:
-            # Network-level failure: connection reset, DNS, etc.
             last_exc = exc
             logger.warning(
                 "Network error calling %s (attempt %d): %s", url, attempt + 1, exc
@@ -273,9 +291,12 @@ async def _get_json_with_retries(
             attempt += 1
             continue
 
-        # Successful response — check for soft "not found" markers.
         if is_not_found(body):
-            raise FetchError(f"No results found for '{params.get('t') or params.get('q', '?')}'", 404)
+            title_hint = (
+                (params or {}).get("q")
+                or url.rsplit("/", 1)[-1]
+            )
+            raise FetchError(f"No results found for '{title_hint}'", 404)
 
         if not isinstance(body, dict):
             raise FetchError("Upstream returned an unexpected response shape", 502)
@@ -311,11 +332,19 @@ _YEAR_RE = re.compile(r"(\d{4})")
 
 
 def _parse_year(value: Any) -> Optional[int]:
-    """Pull the first 4-digit year out of a date-ish string.
+    """Pull the first 4-digit year out of a date-ish string or number.
 
-    Google Books' ``publishedDate`` can be ``"2010"``, ``"2010-08"``, or
-    ``"August 8, 2010"``. OMDb's ``Year`` can be ``"2010"`` or ``"2010–2014"``.
+    Open Library returns ``first_publish_year`` as an int. Wikipedia's
+    ``description`` is free text like ``"2010 film by Christopher Nolan"``.
     """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            year = int(value)
+            return year if 1800 <= year <= 2100 else None
+        except (ValueError, TypeError):
+            return None
     s = _safe_str(value)
     if not s:
         return None

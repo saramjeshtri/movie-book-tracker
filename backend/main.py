@@ -101,7 +101,7 @@ async def fetch_info_endpoint(
         ..., pattern="^(?i)(movie|book)$", description="Either 'movie' or 'book'"
     ),
 ):
-    """Look up a movie/book by title via OMDb / Google Books.
+    """Look up a movie/book by title via Wikipedia / Open Library.
 
     Returns the normalized record so the frontend can prefill the create
     form. Errors are translated into HTTP responses the frontend can show.
