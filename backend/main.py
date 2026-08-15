@@ -40,7 +40,7 @@ def read_root():
 
 @app.post("/items")
 def create_item(item: ItemCreate, db: Session = Depends(get_db)):
-    db_item = models.Item(title=item.title, type=item.type.lower)
+    db_item = models.Item(title=item.title, type=item.type.lower())
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
