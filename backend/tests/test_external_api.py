@@ -1,8 +1,8 @@
 """Tests for the external API integration layer.
 
 All HTTP traffic is intercepted via ``respx`` so the tests don't depend on
-OMDb or Google Books being reachable. The OMDb API key is set via env var
-to satisfy :func:`services.external_api._get_omdb_key`.
+OMDb, Google Books, or Open Library being reachable. The OMDb API key is
+set via env var to satisfy :func:`services.external_api._get_omdb_key`.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ os.environ.setdefault("GOOGLE_BOOKS_API_KEY", "test-gbooks-key")
 from services.external_api import (  # noqa: E402  (import after env setup)
     GOOGLE_BOOKS_BASE_URL,
     OMDB_BASE_URL,
+    OPEN_LIBRARY_BASE_URL,
     FetchError,
     fetch_info,
 )
@@ -66,6 +67,98 @@ GBOOKS_OK = {
 }
 
 GBOOKS_NOT_FOUND = {"totalItems": 0, "items": []}
+
+# Open Library search result — no ``key`` so the best-effort work-detail
+# enrichment call is skipped in the basic fallback tests.
+OPENLIB_OK = {
+    "numFound": 1,
+    "docs": [
+        {
+            "title": "The Hobbit",
+            "first_publish_year": 1937,
+            "cover_i": 10520091,
+            "subject": ["Fantasy fiction", "Adventure"],
+            "first_sentence": [
+                "In een hol onder de grond woonde een hobbit.",
+                "In a hole in the ground there lived a hobbit.",
+            ],
+        }
+    ],
+}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_books_key_rejected_falls_back_to_openlibrary():
+    """Google Books 401/403 (bad/blocked key) → keyless Open Library instead."""
+    respx.get(GOOGLE_BOOKS_BASE_URL).mock(
+        return_value=httpx.Response(403, json={"error": "blocked"})
+    )
+    respx.get(OPEN_LIBRARY_BASE_URL).mock(
+        return_value=httpx.Response(200, json=OPENLIB_OK)
+    )
+
+    record = await fetch_info("The Hobbit", "book")
+
+    assert record == {
+        "title": "The Hobbit",
+        "poster_url": "https://covers.openlibrary.org/b/id/10520091-M.jpg",
+        "description": "In a hole in the ground there lived a hobbit.",
+        "year": 1937,
+        "genre": "Fantasy fiction, Adventure",
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_books_rate_limited_falls_back_to_openlibrary():
+    """Google Books 429 (keyless tier throttling) → Open Library instead."""
+    respx.get(GOOGLE_BOOKS_BASE_URL).mock(
+        return_value=httpx.Response(429, json={"error": "rate limit"})
+    )
+    respx.get(OPEN_LIBRARY_BASE_URL).mock(
+        return_value=httpx.Response(200, json=OPENLIB_OK)
+    )
+
+    record = await fetch_info("The Hobbit", "book")
+
+    assert record["title"] == "The Hobbit"
+    assert record["year"] == 1937
+    assert record["poster_url"] == (
+        "https://covers.openlibrary.org/b/id/10520091-M.jpg"
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_openlibrary_work_detail_enriches_record():
+    """Best-effort work-detail call upgrades description/genre when present."""
+    doc_with_key = dict(OPENLIB_OK["docs"][0], key="/works/OL27482W")
+    respx.get(GOOGLE_BOOKS_BASE_URL).mock(
+        return_value=httpx.Response(403, json={"error": "blocked"})
+    )
+    respx.get(OPEN_LIBRARY_BASE_URL).mock(
+        return_value=httpx.Response(
+            200, json={"numFound": 1, "docs": [doc_with_key]}
+        )
+    )
+    respx.get("https://openlibrary.org/works/OL27482W.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "description": {
+                    "type": "/type/text",
+                    "value": "The Hobbit is a tale of high adventure...",
+                },
+                "subjects": ["Fantasy", "Hobbits (Fictitious characters)", "Middle Earth"],
+            },
+        )
+    )
+
+    record = await fetch_info("The Hobbit", "book")
+
+    assert record["description"] == "The Hobbit is a tale of high adventure..."
+    assert record["genre"] == "Fantasy, Hobbits (Fictitious characters), Middle Earth"
 
 
 @pytest.mark.asyncio

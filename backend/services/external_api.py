@@ -4,6 +4,8 @@ Two free sources:
 - OMDb (http://www.omdbapi.com/) for movies — requires OMDB_API_KEY.
 - Google Books (https://www.googleapis.com/books/v1/volumes) for books — no
   key required, but an optional GOOGLE_BOOKS_API_KEY raises the rate limit.
+  Books fall back to keyless Open Library (https://openlibrary.org/) when
+  Google Books is unavailable (bad/missing key, rate limit, outage).
 
 Public entry point: :func:`fetch_info`. It routes by ``type``, calls the
 appropriate provider, and normalizes the result into the shared schema::
@@ -22,7 +24,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import httpx
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 OMDB_BASE_URL = "http://www.omdbapi.com/"
 GOOGLE_BOOKS_BASE_URL = "https://www.googleapis.com/books/v1/volumes"
+OPEN_LIBRARY_BASE_URL = "https://openlibrary.org/search.json"
 
 # Per-request timeout. Short enough that a hung upstream doesn't pin the
 # FastAPI worker, long enough for a slow but healthy response.
@@ -158,13 +161,41 @@ def _normalize_poster(value: Any) -> Optional[str]:
     return s.replace("http://", "https://", 1) if s.startswith("http://") else s
 
 
-# --- Google Books -----------------------------------------------------------
+# --- Books: Google Books with an Open Library fallback ----------------------
 
 def _get_google_books_key() -> Optional[str]:
     return os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip() or None
 
 
 async def _fetch_book(title: str) -> NormalizedRecord:
+    """Look up a book, Google Books first with an Open Library fallback.
+
+    Google Books is the primary source (per the project spec; an optional
+    ``GOOGLE_BOOKS_API_KEY`` raises its rate limit). Because the key is
+    optional and can be rejected, and the keyless tier rate-limits shared
+    IPs, we fall back to keyless Open Library whenever Google Books fails
+    with a service error (bad key, rate limit, outage). A definitive "no
+    results" (404) from Google Books is respected as-is.
+    """
+    try:
+        return await _fetch_book_google(title)
+    except FetchError as exc:
+        if exc.status_code == 404:
+            raise  # Google Books definitively found nothing
+        logger.warning(
+            "Google Books unavailable (%s); falling back to Open Library", exc
+        )
+        try:
+            return await _fetch_book_openlibrary(title)
+        except FetchError as fallback_exc:
+            # Open Library failed too — report the primary failure, unless
+            # the fallback itself is a clean "no results".
+            if fallback_exc.status_code == 404:
+                raise fallback_exc
+            raise exc
+
+
+async def _fetch_book_google(title: str) -> NormalizedRecord:
     params: dict[str, str] = {"q": title, "maxResults": "1"}
     api_key = _get_google_books_key()
     if api_key:
@@ -194,12 +225,106 @@ async def _fetch_book(title: str) -> NormalizedRecord:
     )
 
 
+async def _fetch_book_openlibrary(title: str) -> NormalizedRecord:
+    # Ask the search index for the fields we need up front — that's more
+    # reliable than relying on the default result shape.
+    params = {
+        "q": title,
+        "limit": "1",
+        "fields": "title,first_sentence,subject,cover_i,first_publish_year,key",
+    }
+
+    payload = await _get_json_with_retries(
+        url=OPEN_LIBRARY_BASE_URL,
+        params=params,
+        is_not_found=lambda body: (
+            isinstance(body, dict) and int(body.get("numFound") or 0) == 0
+        ),
+    )
+
+    docs = payload.get("docs") or []
+    if not docs:
+        raise FetchError(f"No results found for '{title}'", 404)
+
+    doc = docs[0]
+    cover_id = doc.get("cover_i")
+    record = NormalizedRecord(
+        title=_safe_str(doc.get("title")) or title,
+        poster_url=(
+            f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
+            if cover_id is not None
+            else None
+        ),
+        description=_pick_first_sentence(doc.get("first_sentence")),
+        year=_parse_year(doc.get("first_publish_year")),
+        genre=_join_subjects(doc.get("subject")),
+    )
+
+    # Enrich with the work's detail endpoint — it carries a proper
+    # description paragraph and a fuller subject list. Best-effort: any
+    # failure just keeps the search-index record above.
+    work_key = doc.get("key")
+    if work_key:
+        try:
+            work = await _get_json_with_retries(
+                url=f"https://openlibrary.org{work_key}.json",
+                params={},
+                is_not_found=lambda body: False,
+            )
+            description = _extract_description(work.get("description"))
+            if description:
+                record = replace(record, description=description)
+            genre = _join_subjects(work.get("subjects"))
+            if genre:
+                record = replace(record, genre=genre)
+        except FetchError as exc:
+            logger.warning(
+                "Open Library work detail unavailable for %s: %s", work_key, exc
+            )
+
+    return record
+
+
 def _join_categories(value: Any) -> Optional[str]:
     """Google Books returns ``categories`` as a list of strings."""
     if isinstance(value, list):
         parts = [str(v).strip() for v in value if v]
         parts = [p for p in parts if p]
         return ", ".join(parts) if parts else None
+    return _safe_str(value)
+
+
+def _join_subjects(value: Any, max_items: int = 5) -> Optional[str]:
+    """Open Library returns ``subject``/``subjects`` as lists — cap and join."""
+    if isinstance(value, list):
+        parts = [str(v).strip() for v in value if v]
+        parts = [p for p in parts if p]
+        if not parts:
+            return None
+        return ", ".join(parts[:max_items])
+    return _safe_str(value)
+
+
+def _pick_first_sentence(value: Any) -> Optional[str]:
+    """Open Library's ``first_sentence`` is a list of translations/editions.
+
+    Prefer the longest ASCII-only entry — most likely the full English
+    opening line — and fall back to the first entry.
+    """
+    if not isinstance(value, list):
+        return _safe_str(value)
+    ascii_entries = [
+        s for v in value if v and (s := str(v).strip()) and s.isascii()
+    ]
+    if ascii_entries:
+        return max(ascii_entries, key=len)
+    return _safe_str(value[0]) if value else None
+
+
+def _extract_description(value: Any) -> Optional[str]:
+    """Open Library descriptions can be a string or a ``{"value": ...}`` dict."""
+    if isinstance(value, dict):
+        return _safe_str(value.get("value"))
     return _safe_str(value)
 
 
