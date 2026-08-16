@@ -37,6 +37,7 @@ class ItemCreate(BaseModel):
     description: Optional[str] = None
     year: Optional[int] = None
     genre: Optional[str] = None
+    status: Optional[str] = None
 
 
 class ItemUpdate(BaseModel):
@@ -59,6 +60,7 @@ def create_item(item: ItemCreate, db: Session = Depends(get_db)):
         description=item.description,
         year=item.year,
         genre=item.genre,
+        status=item.status or "want_to_watch",
     )
     db.add(db_item)
     db.commit()
