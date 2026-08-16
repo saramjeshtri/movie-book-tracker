@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Movie &amp; Book Tracker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <h1 class="logo">Movie &amp; Book Tracker</h1>
+      <p class="tagline">Track what you want to watch or read, and what you already finished.</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- Global message banner (errors / warnings / success) -->
+    <div id="banner" class="banner" hidden></div>
+
+    <!-- Add item -->
+    <section class="card panel" aria-labelledby="add-heading">
+      <h2 id="add-heading" class="panel-title">Add a title</h2>
+      <form id="add-form" class="add-form" autocomplete="off">
+        <div class="field grow">
+          <label for="title-input">Title</label>
+          <input id="title-input" name="title" type="text" placeholder="e.g. Inception" required />
+        </div>
+        <div class="field">
+          <label for="type-input">Type</label>
+          <select id="type-input" name="type">
+            <option value="movie">Movie</option>
+            <option value="book">Book</option>
+          </select>
+        </div>
+        <button id="add-btn" class="btn primary" type="submit">Add</button>
+      </form>
+      <p class="hint">Details (poster, year, genre, description) are fetched automatically.</p>
+    </section>
+
+    <!-- Filters and sorting -->
+    <section class="controls" aria-label="Filter and sort">
+      <div class="pills" id="status-filters" role="group" aria-label="Filter by status"></div>
+
+      <div class="control-group">
+        <input id="search-input" class="search" type="search" placeholder="Search titles…" aria-label="Search titles" />
+
+        <select id="type-filter" aria-label="Filter by type">
+          <option value="all">All types</option>
+          <option value="movie">Movies</option>
+          <option value="book">Books</option>
+        </select>
+
+        <select id="sort-select" aria-label="Sort by">
+          <option value="newest">Newest first</option>
+          <option value="title">Title A–Z</option>
+          <option value="rating">Highest rated</option>
+          <option value="year">Newest release</option>
+        </select>
+      </div>
+    </section>
+
+    <!-- List -->
+    <section id="list" class="grid" aria-live="polite" aria-label="Your list"></section>
+    <p id="empty-state" class="empty" hidden></p>
+  </main>
+
+  <footer class="wrap footer">
+    <span id="count-summary"></span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
