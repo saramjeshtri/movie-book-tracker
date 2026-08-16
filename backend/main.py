@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -10,6 +11,13 @@ import models
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --- DB session dependency ---
@@ -25,6 +33,10 @@ def get_db():
 class ItemCreate(BaseModel):
     title: str
     type: str
+    poster_url: Optional[str] = None
+    description: Optional[str] = None
+    year: Optional[int] = None
+    genre: Optional[str] = None
 
 
 class ItemUpdate(BaseModel):
@@ -40,7 +52,14 @@ def read_root():
 
 @app.post("/items")
 def create_item(item: ItemCreate, db: Session = Depends(get_db)):
-    db_item = models.Item(title=item.title, type=item.type.lower())
+    db_item = models.Item(
+        title=item.title,
+        type=item.type.lower(),
+        poster_url=item.poster_url,
+        description=item.description,
+        year=item.year,
+        genre=item.genre,
+    )
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
